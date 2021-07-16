@@ -8,8 +8,11 @@
 #include <sbi/sbi_hart.h>
 #include <sbi/sbi_platform.h>
 #include <sbi/sbi_console.h>
+#include <sbi/sbi_trap.h>
 #include <sbi_utils/irqchip/plic.h>
-#include <sbi_utils/sys/clint.h>
+#include <sbi/sbi_system.h>
+#include <sbi_utils/ipi/aclint_mswi.h>
+#include <sbi_utils/timer/aclint_mtimer.h>
 #include <sbi_utils/serial/sunxi-uart.h>
 #include "sunxi_platform.h"
 #include "private_opensbi.h"
@@ -19,6 +22,28 @@
 #define SBI_SET_DEBUG_LEVEL             (SBI_EXT_VENDOR_START + 0x1001)
 #define SBI_SET_DEBUG_DRAM_CRC_PARAS    (SBI_EXT_VENDOR_START + 0x1002)
 #define SBI_SET_UART_BAUDRATE           (SBI_EXT_VENDOR_START + 0x1003)
+
+static struct aclint_mswi_data mswi = {
+	.size = ACLINT_MSWI_SIZE,
+	.first_hartid = 0,
+	.hart_count = 1,
+};
+
+static struct aclint_mtimer_data mtimer = {
+	.size = ACLINT_MTIMER_SIZE,
+	.first_hartid = 0,
+	.hart_count = 1,
+	.has_64bit_mmio = FALSE,
+};
+
+static void c910_system_reset(u32 type, u32 reason);
+static int c910_system_reset_check(u32 type, u32 reason);
+
+static struct sbi_system_reset_device c910_reset = {
+	.name = "c910_reset",
+	.system_reset_check = c910_system_reset_check,
+	.system_reset = c910_system_reset,
+};
 
 extern struct private_opensbi_head  opensbi_head;
 struct c910_regs_struct c910_regs;
@@ -44,6 +69,8 @@ static int c910_early_init(bool cold_boot)
 		addr = opensbi_head.dtb_base;
 		sbi_printf("opensbi r: %ld\n", addr);
 	if (cold_boot) {
+		sbi_system_reset_set_device(&c910_reset);
+
 		/* Load from boot core */
 		c910_regs.pmpaddr0 = csr_read(CSR_PMPADDR0);
 		c910_regs.pmpaddr1 = csr_read(CSR_PMPADDR1);
@@ -131,12 +158,13 @@ static int c910_ipi_init(bool cold_boot)
 	int rc;
 
 	if (cold_boot) {
-		rc = clint_cold_ipi_init(c910_regs.clint_base_addr, C910_HART_COUNT);
+		mswi.addr = c910_regs.clint_base_addr + CLINT_MSWI_OFFSET;
+		rc = aclint_mswi_cold_init(&mswi);
 		if (rc)
 			return rc;
 	}
 
-	return clint_warm_ipi_init();
+	return aclint_mswi_warm_init();
 }
 
 static int c910_timer_init(bool cold_boot)
@@ -144,23 +172,16 @@ static int c910_timer_init(bool cold_boot)
 	int ret;
 
 	if (cold_boot) {
-		ret = clint_cold_timer_init(c910_regs.clint_base_addr,
-					C910_HART_COUNT, FALSE);
+		mtimer.addr = c910_regs.clint_base_addr + CLINT_MTIMER_OFFSET;
+		ret = aclint_mtimer_cold_init(&mtimer, NULL);
 		if (ret)
 			return ret;
 	}
 
-	return clint_warm_timer_init();
+	return aclint_mtimer_warm_init();
 }
 
-static int c910_system_shutdown(u32 type)
-{
-	/*TODO:power down something*/
-	while(1);
-	return 0;
-}
-
-static int sunxi_system_reboot(u32 type)
+static int sunxi_system_reboot()
 {
 
 	sbi_printf("sbi reboot\n");
@@ -180,6 +201,24 @@ static int sunxi_system_reboot(u32 type)
 	writel(value, reg);
 	return 0;
 }
+
+static int c910_system_reset_check(u32 type, u32 reason)
+{
+	return 1;
+}
+
+static void c910_system_reset(u32 type, u32 reason)
+{
+	switch (type) {
+		case SBI_SRST_RESET_TYPE_SHUTDOWN:
+			while(1) asm volatile ("wfi");
+		case SBI_SRST_RESET_TYPE_COLD_REBOOT:
+		case SBI_SRST_RESET_TYPE_WARM_REBOOT:
+			sunxi_system_reboot();
+			break;
+	}
+}
+
 
 void sbi_set_pmu()
 {
@@ -228,32 +267,32 @@ void sbi_boot_other_core(int hartid)
 }
 
 static int c910_vendor_ext_provider(long extid, long funcid,
-				unsigned long *args,
+				const struct sbi_trap_regs *regs,
 				unsigned long *out_value,
 				struct sbi_trap_info *out_trap)
 {
 	switch (extid) {
 	case SBI_EXT_VENDOR_C910_BOOT_OTHER_CORE:
-		sbi_boot_other_core((int)args[0]);
+		sbi_boot_other_core((int)(regs->a0));
 		break;
 	case SBI_EXT_VENDOR_C910_SET_PMU:
 		sbi_set_pmu();
 		break;
 	case SBI_EXT_VENDOR_C910_SYSPEND:
-		sbi_system_suspend(args[0]);
+		sbi_system_suspend(regs->a0);
 		break;
 	case SBI_SET_WAKEUP_TIMER:
-		sbi_set_wakeup_src_timer((unsigned int)args[0]);
+		sbi_set_wakeup_src_timer((unsigned int)(regs->a0));
 		break;
 	case SBI_SET_DEBUG_LEVEL:
 		break;
 	case SBI_SET_DEBUG_DRAM_CRC_PARAS:
-		sbi_set_dram_crc_paras(args[0], args[1], args[2]);
+		sbi_set_dram_crc_paras(regs->a0, regs->a1, regs->a2);
 		break;
 	case SBI_SET_UART_BAUDRATE:
 		break;
 	case SBI_EXT_VENDOR_C910_WAKEUP:
-		sbi_system_set_wakeup(args[0], args[1]);
+		sbi_system_set_wakeup(regs->a0, regs->a1);
 		break;
 
 	default:
@@ -263,85 +302,13 @@ static int c910_vendor_ext_provider(long extid, long funcid,
 	return 0;
 }
 
-/* Get number of PMP regions for given HART. */
-static u32 sunxi_pmp_region_count(u32 hartid)
-{
-	return 4;
-}
-
-static unsigned long log2roundup(unsigned long x)
-{
-	unsigned long ret = 0;
-
-	while (ret < __riscv_xlen) {
-		if (x <= (1UL << ret))
-			break;
-		ret++;
-	}
-
-	return ret;
-}
-/*
- * Get PMP regions details (namely: protection, base address, and size) for
- * a given HART.
- */
-static int sunxi_pmp_region_info(u32 hartid, u32 index, ulong *prot,
-				 ulong *addr, ulong *log2size)
-{
-	int ret = 0;
-
-	switch (index) {
-	case 0:
-		*prot	  = PMP_R | PMP_W | PMP_X;
-		*addr	  = 0x40000000;
-		*log2size = log2roundup(0x40000000);
-		break;
-	case 1:
-		*prot	  = PMP_R | PMP_W | PMP_X;
-		*addr	  = 0x80000000;
-		*log2size = log2roundup(0x40000000);
-		break;
-	case 2:
-		*prot	  = PMP_R | PMP_W | PMP_X;
-		*addr	  = 0x20000;
-		*log2size = log2roundup(0x8000);
-		break;
-	case 3:
-		*prot	  = PMP_R | PMP_W;
-		*addr	  = 0x0;
-		*log2size = log2roundup(0x40000000);
-		break;
-	default:
-		ret = -1;
-		break;
-	};
-
-	return ret;
-}
-
 const struct sbi_platform_operations platform_ops = {
 	.early_init          = c910_early_init,
 	.final_init          = c910_final_init,
-
-	.pmp_region_count    = sunxi_pmp_region_count,
-	.pmp_region_info     = sunxi_pmp_region_info,
-
-	.console_putc        = sunxi_uart_putc,
-	.console_getc        = sunxi_uart_getc,
 	.console_init        = sunxi_console_init,
-
 	.irqchip_init        = c910_irqchip_init,
-
 	.ipi_init            = c910_ipi_init,
-	.ipi_send            = clint_ipi_send,
-	.ipi_clear           = clint_ipi_clear,
-
 	.timer_init          = c910_timer_init,
-	.timer_event_start   = clint_timer_event_start,
-
-	.system_reboot      = sunxi_system_reboot,
-	.system_shutdown     = c910_system_shutdown,
-
 	.vendor_ext_provider = c910_vendor_ext_provider,
 };
 
@@ -352,6 +319,5 @@ const struct sbi_platform platform = {
 	.features            = SBI_THEAD_FEATURES,
 	.hart_count          = C910_HART_COUNT,
 	.hart_stack_size     = C910_HART_STACK_SIZE,
-	.disabled_hart_mask  = 0,
 	.platform_ops_addr   = (unsigned long)&platform_ops
 };

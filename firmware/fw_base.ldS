@@ -17,6 +17,9 @@
 
 	.text :
  	{
+
+		KEEP(*opensbi_head.o(.head_data*))
+		. = ALIGN(0x400);
 		PROVIDE(_text_start = .);
 		*(.entry)
 		*(.text)
